@@ -1,12 +1,17 @@
 #!/usr/bin/python
+#
+# /!\ Backported from Ansible 2.6. /!\
+# Once we've upgraded to a supported version, we should drop this module and
+# any references to it in favor of the upstream version. <3
+#
 # Copyright (c) 2017, 2018 Michael De La Rue
 # Copyright (c) 2017, 2018 Will Thames
 # Copyright (c) 2017 Ansible Project
 # GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-ANSIBLE_METADATA = {'status': ['preview'],
-                    'supported_by': 'community',
-                    'metadata_version': '1.1'}
+ANSIBLE_METADATA = {'metadata_version': '1.0',
+                    'status': ['preview'],
+                    'supported_by': 'Duo'}
 
 DOCUMENTATION = '''
 ---
@@ -42,7 +47,6 @@ EXAMPLES = '''
 - rds_instance_facts:
     name: new-database
   register: new_database_facts
-
 # Get all RDS instances
 - rds_instance_facts:
 '''
@@ -340,14 +344,15 @@ instances:
           sample: sg-abcd1234
 '''
 
-from ansible.module_utils.aws.core import AnsibleAWSModule
-from ansible.module_utils.ec2 import ansible_dict_to_boto3_filter_list, boto3_tag_list_to_ansible_dict, AWSRetry, camel_dict_to_snake_dict
+import traceback
+from ansible.module_utils.basic import AnsibleModule, to_text, to_native
+from ansible.module_utils.ec2 import ansible_dict_to_boto3_filter_list, boto3_tag_list_to_ansible_dict, AWSRetry, camel_dict_to_snake_dict, HAS_BOTO3, ec2_argument_spec, boto3_conn, get_aws_connection_info
 
 
 try:
     import botocore
 except ImportError:
-    pass  # handled by AnsibleAWSModule
+    pass  # will be detected by imported HAS_BOTO3
 
 
 def instance_facts(module, conn):
@@ -366,30 +371,49 @@ def instance_facts(module, conn):
     except conn.exceptions.from_code('DBInstanceNotFound'):
         results = []
     except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
-        module.fail_json_aws(e, "Couldn't get instance information")
+        module.fail_json(msg="Couldn't get instance information",
+                         exception=traceback.format_exc(), **camel_dict_to_snake_dict(e.response))
 
     for instance in results:
         try:
-            instance['Tags'] = boto3_tag_list_to_ansible_dict(conn.list_tags_for_resource(ResourceName=instance['DBInstanceArn'],
-                                                                                          aws_retry=True)['TagList'])
+            instance['Tags'] = boto3_tag_list_to_ansible_dict(conn.list_tags_for_resource(ResourceName=instance['DBInstanceArn'])['TagList'])
         except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
-            module.fail_json_aws(e, "Couldn't get tags for instance %s" % instance['DBInstanceIdentifier'])
+            module.fail_json(msg="Couldn't get tags for instance %s" % instance['DBInstanceIdentifier'],
+                             exception=traceback.format_exc(), **camel_dict_to_snake_dict(e.response))
 
-    return dict(changed=False, instances=[camel_dict_to_snake_dict(instance, ignore_list=['Tags']) for instance in results])
+    return dict(changed=False, instances=[camel_dict_to_snake_dict(instance) for instance in results])
+
+
+def get_rds_connection(module, aws_connect_kwargs, region):
+    params = dict(module=module, conn_type='client', resource='rds',
+                  region=region, endpoint=None, **aws_connect_kwargs)
+
+    return boto3_conn(**params)
 
 
 def main():
-    argument_spec = dict(
-        db_instance_identifier=dict(aliases=['id']),
-        filters=dict(type='dict')
+    argument_spec = ec2_argument_spec()
+    argument_spec.update(
+        dict(
+            db_instance_identifier=dict(aliases=['id']),
+            filters=dict(type='dict')
+        )
     )
 
-    module = AnsibleAWSModule(
+    module = AnsibleModule(
         argument_spec=argument_spec,
         supports_check_mode=True,
     )
 
-    conn = module.client('rds', retry_decorator=AWSRetry.jittered_backoff(retries=10))
+    if not HAS_BOTO3:
+        module.fail_json(msg='boto3 and botocore required for this module')
+
+    region, ec2_url, aws_connect_kwargs = get_aws_connection_info(module, boto3=True)
+    try:
+        conn = get_rds_connection(module, aws_connect_kwargs, region)
+    except (botocore.exceptions.NoCredentialsError, botocore.exceptions.ProfileNotFound) as e:
+        module.fail_json(msg="Can't authorize connection. Check your credentials and profile.",
+                         exceptions=traceback.format_exc(), **camel_dict_to_snake_dict(e.response))
 
     module.exit_json(**instance_facts(module, conn))
 
